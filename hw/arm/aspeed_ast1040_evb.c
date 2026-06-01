@@ -8,16 +8,58 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/aspeed.h"
 #include "hw/arm/aspeed_soc.h"
 #include "hw/core/qdev-clock.h"
+#include "hw/misc/aspeed_cptra_mbox.h"
 #include "system/system.h"
 #include "hw/i2c/smbus_eeprom.h"
 
 #define AST1040_INTERNAL_FLASH_SIZE (4 * MiB)
 /* Main SYSCLK frequency in Hz (400MHz) */
 #define SYSCLK_FRQ 400000000ULL
+
+#define TYPE_AST1040_EVB_MACHINE MACHINE_TYPE_NAME("ast1040-evb")
+OBJECT_DECLARE_SIMPLE_TYPE(Ast1040EvbMachineState, AST1040_EVB_MACHINE)
+
+struct Ast1040EvbMachineState {
+    AspeedMachineState parent_obj;
+
+    char *cptra_peer;
+    Notifier machine_done;
+};
+
+static void aspeed_bic_machine_done(Notifier *notifier, void *data)
+{
+    Ast1040EvbMachineState *m = container_of(notifier,
+                                             Ast1040EvbMachineState,
+                                             machine_done);
+    AspeedMachineState *bmc = ASPEED_MACHINE(m);
+    Aspeed1040SoCState *a1040 = ASPEED1040_SOC(bmc->soc);
+    bool ambiguous = false;
+    Object *peer;
+    Error *err = NULL;
+
+    if (!m->cptra_peer) {
+        return;
+    }
+
+    peer = object_resolve_path_type(m->cptra_peer, TYPE_CPTRA_MBOX_PEER,
+                                    &ambiguous);
+    if (!peer || ambiguous) {
+        error_report("cptra-peer: peer '%s' not found%s",
+                     m->cptra_peer, ambiguous ? " (ambiguous)" : "");
+        exit(1);
+    }
+
+    if (!aspeed_cptra_mbox_set_peer(&a1040->cptra_mbox,
+                                    CPTRA_MBOX_PEER(peer), &err)) {
+        error_report_err(err);
+        exit(1);
+    }
+}
 
 static void aspeed_bic_machine_init(MachineState *machine)
 {
@@ -42,6 +84,13 @@ static void aspeed_bic_machine_init(MachineState *machine)
         amc->i2c_init(bmc);
     }
 
+    if (AST1040_EVB_MACHINE(machine)->cptra_peer) {
+        AST1040_EVB_MACHINE(machine)->machine_done.notify =
+            aspeed_bic_machine_done;
+        qemu_add_machine_init_done_notifier(
+            &AST1040_EVB_MACHINE(machine)->machine_done);
+    }
+
     armv7m_load_kernel(ARM_CPU(first_cpu),
                        machine->kernel_filename,
                        0,
@@ -55,6 +104,22 @@ static void ast1040_evb_i2c_init(AspeedMachineState *bmc)
 
     smbus_eeprom_init_one(aspeed_i2c_get_bus(&soc->i2c, 0), 0x50, eeprom_buf);
     i2c_slave_create_simple(aspeed_i2c_get_bus(&soc->i2c, 1), "tmp105", 0x4d);
+}
+
+static char *aspeed_bic_get_cptra_peer(Object *obj, Error **errp)
+{
+    Ast1040EvbMachineState *m = AST1040_EVB_MACHINE(obj);
+
+    return g_strdup(m->cptra_peer);
+}
+
+static void aspeed_bic_set_cptra_peer(Object *obj, const char *value,
+                                      Error **errp)
+{
+    Ast1040EvbMachineState *m = AST1040_EVB_MACHINE(obj);
+
+    g_free(m->cptra_peer);
+    m->cptra_peer = g_strdup(value);
 }
 
 static void aspeed_machine_ast1040_evb_class_init(ObjectClass *oc,
@@ -73,12 +138,19 @@ static void aspeed_machine_ast1040_evb_class_init(ObjectClass *oc,
     amc->macs_mask = 0;
     amc->uart_default = ASPEED_DEV_UART12;
     aspeed_machine_class_init_cpus_defaults(mc);
+
+    object_class_property_add_str(oc, "cptra-peer",
+                                  aspeed_bic_get_cptra_peer,
+                                  aspeed_bic_set_cptra_peer);
+    object_class_property_set_description(oc, "cptra-peer",
+        "Caliptra mailbox peer object id");
 }
 
 static const TypeInfo aspeed_ast1040_evb_types[] = {
     {
-        .name           = MACHINE_TYPE_NAME("ast1040-evb"),
+        .name           = TYPE_AST1040_EVB_MACHINE,
         .parent         = TYPE_ASPEED_MACHINE,
+        .instance_size  = sizeof(Ast1040EvbMachineState),
         .class_init     = aspeed_machine_ast1040_evb_class_init,
     }
 };
